@@ -18,11 +18,118 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 import numpy as np
 import copy
+from abc import ABC, abstractmethod
 
 import model.shift
 
+class Model(ABC):
+    """ 
+    Abstract class for a PDAF compatible model. 
+    
+    Methods
+    -------
+    init_field 
+        Initialises model field at beginning of model run. 
+    step 
+        Step the model forward in time from given step.  
+    collect_state_pdaf
+        Outputs local model fields as array to be collected by PDAF.
+    distribute_state_pdaf
+        Accepts corrected local model fields from PDAF as 1D array. 
+        
+    """
+    
+    @abstractmethod
+    def init_field(self):
+        """
+        Initialises model field at beginning of model run. 
+        """
+    
+    @abstractmethod 
+    def step(self, step):
+        """ 
+        Step the model forward in time from given step.  
+        
+        Parameters
+        ----------
+        step : int
+            current time step
+        use_pdaf : bool
+            whether PDAF is used at this step
+            
+        """
+        
+    @abstractmethod
+    def collect_state_pdaf(self, dim_p, state_p):
+        """Outputs local model fields as array to be collected by PDAF.
 
-class Model:
+        Aim of this method is to reshape the different models fields 
+        into 1 long 1D array that and returns this one so it can 
+        be processed by PDAF. As such it is the opposite of 
+        `distribute_state_pdaf`. Relies on Python's pass by reference. 
+        The interface of this method should not be changed as it must 
+        match the equivalent PDAF interface. 
+
+        Parameters
+        ----------
+        dim_p : int 
+            Size of array state_p.
+        state_p : ndarray
+            Allocated 1D array to store the output of this method.    
+            
+        Returns
+        -------
+        state_p : 1D numpy array 
+            Model fields for this process concatenated into 1D array 
+            in Fortran ordering.  
+    
+    """
+    
+    @abstractmethod
+    def distribute_state_pdaf(self, dim_p, state_p):
+        """Accepts corrected local model fields from PDAF as 1D array. 
+
+        Aim of this method is to reshape the 1D array from PDAF back
+        into different model fields of different sizes. As such 
+        it is the opposite to `collect_state_pdaf`. Relies on Python's 
+        pass by reference. The interface of this method should not be 
+        changed as it must match the equivalent PDAF interface. 
+
+        Parameters
+        ----------
+        dim_p : int 
+            Size of state_p. 
+        state_p : 1D numpy array
+            1D array containing the model fields for this process.
+        
+        Returns
+        -------
+        state_p :
+            Same as intput state_p
+
+        """
+        
+class Ar1Model(Model):
+    
+    def __init__(self, nx, nt, comm_controller, 
+                 parameters=np.array([1.0])):
+        self.set_attributes(nt, nx, nx)
+        self.comm = comm_controller 
+        self.ar = self.parameters
+        
+    def init_field(self):
+        self.field_p = np.random.normal(size=np.shape(self.field_p), scale=self.ar[0])
+        for n in range(1, np.size(self.field_p,0)):
+            self.field_p[n] = ar[1] * self.field_p[n-1] + np.sqrt(1-ar[1]**2) * self.field_p[n]
+    
+    def step(self, step, use_pdaf):
+        self.field = np.roll(self.field, 1, axis=0)
+        return self.field
+        
+      
+
+
+class OldModel:
 
     """Model information in PDAF
 
