@@ -134,3 +134,7 @@ dmypy.json
 *.npz
 *.a
 *.c
+
+.vscode/
+*.txt
+tutorials/inputs_online
