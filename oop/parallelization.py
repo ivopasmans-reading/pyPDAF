@@ -18,7 +18,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 from mpi4py import MPI
 import numpy as np
-from abc import ABC, abstractmethod 
 import sys
 
 class ProcessControl:
@@ -30,10 +29,9 @@ class ProcessControl:
     if the parallellization scheme doesn't supply them. By default
     serial run is assumed. 
     """
-    
-    def __init__(self, name="world"):
+
+    def __init__(self, name="world", parent=None):
         self.name = name
-        self.comm = None
         self.parent = None
         
     @property 
@@ -110,13 +108,17 @@ class ProcessControl:
             self.abort()
         else:
             self.parent.throw_error(message)
+            
+    def sum(self, send):
+        """ Sum over all processes in communicator."""
+        return send
     
 class MpiControl(ProcessControl):
     """ Communicator using created using mpi4py. """
     
-    def __init__(self, comm=None, name="world"):
+    def __init__(self, name="world", parent=None, comm=None):
         """ Constructor. Default comm is mpi_comm_world."""
-        self.name = name 
+        super().__init__(name, parent)
         if comm is None:
             self.comm = MPI.COMM_WORLD 
         else:
@@ -164,19 +166,23 @@ class MpiControl(ProcessControl):
         keys = [(n+1,key) for n,(key,value) in enumerate(names.items()) if self.mype in value]
         if len(keys)==0:
             comm = self.comm.Split(MPI.UNDEFINED, self.mype)
-            new  = MpiControl(comm, "sub_"+self.name+"_undefined")
+            new  = MpiControl(name="sub_"+self.name+"_undefined", comm=comm, parent=self)
         elif len(keys)==1:
             color, name = keys[0]
             comm = self.comm.Split(color, self.mype)
-            new  = MpiControl(comm, name)
+            new  = MpiControl(comm=comm, name=name, parent=self)
         else:
             raise ValueError("Process can only be part of a single subcommunicator.")
         
-        new.parent = self 
         return new
         
     def py2f(self):
         return self.comm.py2f()
+    
+    def sum(self, send):
+        recv = 0 
+        recv = MPI.reduce(send, recv, MPI.sum)
+        return recv
         
 class PdafParallelization:
     """ 
@@ -270,7 +276,7 @@ class PdafParallelization:
         if pe>=np.size(self.pe_matrix):
             return (None, None)
         else:
-            return self.unravel_index(pe, self.ge_matrix.shape)
+            return np.unravel_index(pe, self.pe_matrix.shape)
             
     @property 
     def this_comm_model(self):
@@ -304,6 +310,11 @@ class PdafParallelization:
     def n_comm_filters(self):
         """Total number of comm_filter communicators."""
         return 1
+    
+    def sum(self, send):
+        recv = 0 
+        recv = MPI.allreduce(send, recv, MPI.SUM)
+        return recv
         
     def _create_pe_matrix(self):
         """
@@ -315,270 +326,5 @@ class PdafParallelization:
         npes = npes * self.npes_per_model
         self.pe_matrix = np.arange(npes).reshape((-1, self.npes_per_model))
         
-class parallelization:
-
-    """Summary
-
-    Attributes
-    ----------
-    COMM_couple : `MPI.Comm`
-        model and filter coupling communicator
-    COMM_filter : `MPI.Comm`
-        filter communicator
-    COMM_model : `MPI.Comm`
-        model communicator
-    filterpe : bool
-        whether the PE is used for filter
-    local_npes_model : int
-        number of model PEs each member
-    mype_filter : int
-        rank of fileter communicator
-    mype_model : int
-        rank of model communicator
-    mype_world : int
-        rank of world communicator
-    n_filterpes : int
-        number of filter PEs
-    n_modeltasks : int
-        number of model tasks
-    npes_filter : int
-        number of filter PEs
-    npes_model : int
-        number of model PEs
-    npes_world : int
-        number of global PEs
-    task_id : int
-        ensemble id
-    """
-
-    def __init__(self, dim_ens, n_modeltasks, screen):
-        """Init the parallization required by PDAF
-
-        Parameters
-        ----------
-        dim_ens : TYPE
-            Description
-        n_modeltasks : int
-            Number of model tasks/ ensemble size
-            This parameter should be the same
-            as the number of PEs
-        screen : int
-            The verbose level of screen output.
-            screen = 3 is the most verbose level.
-        """
-
-        self.n_modeltasks = n_modeltasks
-        self.n_filterpes = 1
-
-        self.init_parallel()
-        self.getEnsembleSize()
-
-        # Initialize communicators for ensemble evaluations
-        if (self.mype_world == 0):
-            print(('Initialize communicators for assimilation with PDAF'))
-
-        self.isCPUConsistent()
-        self.isTaskConsistent(n_modeltasks)
-
-        # get ensemble communicator
-        self.getModelComm()
-        self.getModelPERankSize()
-
-        if (screen > 1):
-            print(('MODEL: mype(w)= ', self.mype_world,
-                   '; model task: ', self.task_id,
-                   '; mype(m)= ', self.mype_model,
-                   '; npes(m)= ', self.npes_model))
-
-        # Generate communicator for filter
-        self.getFilterComm()
-        self.getFilterPERankSize()
-
-        # Generate communicators for communication
-        self.getCoupleComm()
-
-        self.printInfo(screen)
-
-    def printInfo(self, screen):
-        """print parallelization info
-
-        Parameters
-        ----------
-        screen : int
-            The verbose level of screen output.
-        """
-        # *** local variables ***
-        #  Rank and size in COMM_couple
-        mype_couple = self.COMM_couple.Get_rank()
-        #  Variables for communicator-splitting
-        color_couple = self.mype_model + 1
-
-        if (screen > 0):
-            if (self.mype_world == 0):
-                print(('PE configuration:'))
-                print(('world', 'filter', '   model    ',
-                       '   couple   ', 'filterPE'))
-                print(('rank ', ' rank ', 'task',
-                       'rank', 'task', 'rank', 'T/F'))
-                print(('--------------------------------------'))
-            MPI.COMM_WORLD.Barrier()
-            if (self.task_id == 1):
-                print((self.mype_world, self.mype_filter, self.task_id,
-                       self.mype_model, color_couple,
-                       mype_couple, self.filterpe))
-            MPI.COMM_WORLD.Barrier()
-            if (self.task_id > 1):
-                print((self.mype_world, ' ', self.task_id, self.mype_model,
-                       color_couple, mype_couple, self.filterpe))
-            MPI.COMM_WORLD.Barrier()
-            if (self.mype_world == 0):
-                print('')
-
-    def init_parallel(self):
-        """Initialize MPI
-
-        Routine to initialize MPI, the number of PEs
-        (npes_world) and the rank of a PE (mype_world).
-        The model is executed within the scope of the
-        communicator Comm_model. It is also initialized
-        here together with its size (npes_model) and
-        the rank of a PE (mype_model) within Comm_model.
-        """
-
-        if not MPI.Is_initialized():
-            MPI.Init()
-
-        # Initialize model communicator, its size and the process rank
-        # Here the same as for MPI_COMM_WORLD
-        self.COMM_model = MPI.COMM_WORLD
-        self.npes_model = None
-        self.npes_world = None
-        self.mype_model = None
-        self.mype_world = None
-
-        self.npes_world = self.COMM_model.Get_size()
-        self.mype_world = self.COMM_model.Get_rank()
-
-    def getModelComm(self):
-        """get model communicator
-        Generate communicators for model runs
-        (Split COMM_ENSEMBLE)
-        """
-        self.getPEperModel()
-
-        pe_index = np.cumsum(self.local_npes_model, dtype=int)
-
-        mype_ens = self.mype_world
-
-        if mype_ens + 1 <= self.local_npes_model[0]:
-            self.task_id = 1
-        else:
-            self.task_id = np.where(pe_index < mype_ens + 1)[0][-1] + 2
-
-        self.COMM_model = MPI.COMM_WORLD.Split(self.task_id, mype_ens)
-
-    def getFilterComm(self):
-        """Generate communicator for filter
-        """
-        # Init flag FILTERPE (all PEs of model task 1)
-        self.filterpe = True if self.task_id == 1 else False
-
-        my_color = self.task_id if self.filterpe \
-            else MPI.UNDEFINED
-
-        self.COMM_filter = MPI.COMM_WORLD.Split(my_color,
-                                                self.mype_world)
-
-    def getCoupleComm(self):
-        """Generate communicator for filter
-        """
-        # Init flag FILTERPE (all PEs of model task 1)
-        color_couple = self.mype_model + 1
-
-        self.COMM_couple = MPI.COMM_WORLD.Split(color_couple,
-                                                self.mype_world)
-
-    def getModelPERankSize(self):
-        """get model PE rank and size
-        """
-        self.npes_model = self.COMM_model.Get_size()
-        self.mype_model = self.COMM_model.Get_rank()
-
-    def getFilterPERankSize(self):
-        """get filter PE rank and size
-        """
-        self.npes_filter = self.COMM_model.Get_size()
-        self.mype_filter = self.COMM_model.Get_rank()
-
-    def getEnsembleSize(self):
-        """Parse number of model tasks
-
-        The module variable is N_MODELTASKS.
-        Since it has to be equal to the ensemble size
-        we parse dim_ens from the command line.
-        """
-        # handle for command line parser
-        # handle = 'dim_ens'
-        # parse(handle, self.n_modeltasks)
-        pass
-
-    def getPEperModel(self):
-        """Store # PEs per ensemble
-        used for info on PE 0 and for generation
-        of model communicators on other Pes
-        """
-
-        self.local_npes_model = np.zeros(self.n_modeltasks, dtype=int)
-
-        self.local_npes_model[:] = np.floor(
-            self.npes_world/self.n_modeltasks)
-
-        size = self.npes_world \
-            - self.n_modeltasks * self.local_npes_model[0]
-        self.local_npes_model[:size] = self.local_npes_model[:size] + 1
-
-    def isCPUConsistent(self):
-        """Check consistency of number of parallel ensemble tasks
-        """
-        pass
-        if self.n_modeltasks > self.npes_world:
-            # number of parallel tasks is set larger than available PEs ***
-            self.n_modeltasks = self.npes_world
-            if self.mype_world == 0:
-                print('!!! Resetting number of parallel ensemble'
-                      ' tasks to total number of PEs!')
-
-    def isTaskConsistent(self, dim_ens):
-        """Check consistency of number of model tasks
-
-        Parameters
-        ----------
-        dim_ens : int
-            ensemble size
-        """
-
-        # For dim_ens=0 no consistency check
-        # for the ensemble size with the
-        # number of model tasks is performed.
-        if (dim_ens <= 0):
-            return
-
-        # Check consistency with ensemble size
-        if (self.n_modeltasks > dim_ens):
-            # parallel ensemble tasks is set larger than ensemble size
-            self.n_modeltasks = dim_ens
-
-            if (self.mype_world == 0):
-                print(('!!! Resetting number of parallel'
-                       'ensemble tasks to number of ensemble states!'))
-
-    def finalize_parallel(self):
-        """Finalize MPI
-        """
-        MPI.COMM_WORLD.Barrier()
-        MPI.Finalize()
-
-    def abort_parallel(self):
-        """Abort MPI
-        """
-        MPI.COMM_WORLD.Abort(1)
+    def throw_error(self, message):
+        self.comm_world.throw_error(message)

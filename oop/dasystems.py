@@ -18,7 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 import pyPDAF.PDAF as PDAF
 import numpy as np
-from options import ScreenOutput, PdafError, fNAN, iNAN
+from general import ScreenOutput, PdafError, fNAN, iNAN, check_init
 
 class DAS:
     """
@@ -49,7 +49,7 @@ class DAS:
     """
 
     def __init__(self, process_control, models, observations, 
-                analyzer_builder):
+                analyzer, builder):
         """
         Construct the DA system.. 
 
@@ -61,18 +61,21 @@ class DAS:
             Objects co
         observations : list of `observations.Obs` objects
             Objects containing observations and sample operators. 
-        analyzer_builder : `analyzers.AnalyzerBuilder` object 
+        analyzer : `analyzers.Analyzer` object 
             Objects containing information about DA method. 
+        builder : analyzer.AnalyzerBuilder object 
+            Object that builds the user defined PDAF subroutines. 
             
         """
         self.pe = process_control
         self.models = models
-        self.obs = observations 
-        self.builder = analyzer_builder
+        self.observations = observations 
+        self.analyzer = analyzer
+        self.builder = builder 
         self.is_initialized = False 
         self.dim_ens = len(self.models)
         
-    def run(self, steps, vebose=ScreenOutput.quiet):
+    def run(self, steps, verbose=ScreenOutput.standard):
         """ 
         Run the ensemble for steps assimilating on the way. 
         
@@ -88,33 +91,50 @@ class DAS:
         #Initialize models and setup DA 
         self.init(verbose=verbose)
         
-        #Create DA method 
-        last_step = self.step_init + steps
-        self.builder.construct_analyzer()
+        #Determine the last step to be calculated by model. 
+        self.final_step = self.step_init + steps
         
         #Run DA forward in time. 
-        status_pdaf = int(PdafError.none)
-        while not bool(doexit):
+        step_da, status_pdaf = self.step_init, int(PdafError.none)
+        while step_da<=self.final_step:
             #Run model forward to next DA moment.
             for model in self.models_p:
-                self.builder.build(model, self.obs, last_step)
-                analyzer = self.builder.get_analyzer()
+                self.analyzer.build(self, model)
                 
                 #Copy state from ensemble storage to input model.
-                steps_forward, time_now, doexit, status_pdaf  = analyzer.get_state(doexit, status_pdaf)
+                #DONT use doexit here as otherwise to output from last analysis in not copied back in model. 
+                steps_forward, _, _, status_pdaf = self.analyzer.get_state(doexit, status_pdaf)
                 if status_pdaf!=int(PdafError.none):
-                    self.pe.comm_world.throw_error(f"Get_state critically failed to copy ensemble member at step {step}.")   
-                    
+                    self.pe.comm_world.throw_error(f"Get_state critically failed to copy ensemble member at step {step}.")  
+                step_da = model.step + steps_forward
+                
                 #Run model forward in time. 
-                model.step(step, steps_forward)
+                if verbose==ScreenOutput.standard and self.pe.comm_model.is_main:
+                    print(f"Running model {steps_forward} steps from time {model.time}.")
+                if verbose==ScreenOutput.standard:
+                    state_p = model.collect_state_pdaf(model.dim_state,None)
+                    print('State min/max/mean at process {:d}: {:.3e} {:.3e} {:.3e}'.format(self.pe.comm_model.mype,
+                                                                                np.min(state_p),np.max(state_p),
+                                                                                np.mean(state_p)))
+                model.step_forward(model.step, min(self.final_step - model.step, steps_forward))
+                if verbose==ScreenOutput.standard:
+                    state_p = model.collect_state_pdaf(model.dim_state,None)
+                    print('State min/max/mean at process {:d}: {:.3e} {:.3e} {:.3e}'.format(self.pe.comm_model.mype,
+                                                                                 np.min(state_p),np.max(state_p),
+                                                                                 np.mean(state_p)))
+                    
+                #Following part has to be skipped if the last observation has been assimilated.
+                if step_da > self.final_step:
+                    continue
                     
                 #Copy output from model to ensemble storage.
                 status_pdaf = self.analyzer.put_state(doexit, status_pdaf)
                 if status_pdaf!=int(PdafError.none):
                     self.pe.comm_world.throw_error(f"Put_state critically failed to copy ensemble member at step {step}.")  
                     
-            #Update steps left. 
-            steps_left = steps_left - steps_forward                
+                #Deallocate observations after DA. 
+                for obs in self.observations:
+                    obs.deallocate()       
 
     def init(self, verbose=ScreenOutput.quiet):
         """
@@ -126,7 +146,8 @@ class DAS:
             Option for screen output. 
         """
         #Only initialize models on using this comm_model. 
-        self.models_p = [model.init_field(self.pe.comm_model) for n,model in enumerate(self.models) if self.pe.for_comm_model(n)]
+        self.models_p = [model for n,model in enumerate(self.models) if self.pe.for_comm_model(n)]
+        [model.init_fields(self.pe.comm_model) for model in self.models_p]
         if len(self.models_p)==0:
             self.pe.comm_world.throw_error(f"No members assigned to communicator {self.pe.comm_model.name}")
         if not np.all([model.step==self.models_p[0].step for model in self.models_p]):
@@ -135,22 +156,29 @@ class DAS:
             self.step_init = self.models_p[0].step + 0
 
         # init observations
-        PDAF.omi_init(len(self.obs))
+        PDAF.omi_init(len(self.observations))
+        
+        #Number of ensemble members. 
+        self.n_members = len(self.models)
+        #Number of ensemble members using this comm_model. 
+        self.n_members_p = len(self.models_p)
         
         # init PDAF 
-        status_pdaf = PDAF.init(self.analyzer.filtertype,
-                                self.analyzer.subtype,
-                                self.step_init,
-                                self.analyzer.param_i,
-                                self.analyzer.param_r,
-                                self.pe.comm_model.py2f(),
-                                self.pe.comm_filter.py2f(),
-                                self.pe.comm_couple.py2f(), 
-                                self.pe.this_comm_model+1,
-                                self.pe.n_comm_models, 
-                                int(self.pe.this_filter_model is not None),
-                                self.u_init_ens_pdaf, int(self.verbose),
-                                )
+        param_i = np.append([self.models_p[0].dim_state_p, self.n_members], self.analyzer.param_i)
+        param_r = np.append([self.analyzer.inflator.forgetting_factor], self.analyzer.param_r)
+        _,_,status_pdaf = PDAF.init(int(self.analyzer.filtertype),
+                                    int(self.analyzer.subtype),
+                                    int(self.step_init),
+                                    np.array(param_i, dtype=int, order='F'),
+                                    np.array(param_r, dtype=float, order='F'),
+                                    self.pe.comm_model.py2f(),
+                                    self.pe.comm_filter.py2f(),
+                                    self.pe.comm_couple.py2f(), 
+                                    self.pe.this_comm_model+1,
+                                    self.pe.n_comm_models, 
+                                    int(self.pe.this_comm_filter is not None),
+                                    self.u_init_ens_pdaf, int(verbose),
+                                    )
         #Error handling
         if status_pdaf!=int(PdafError.none):
             self.pe.comm_model.throw_error("PDAF.init critically failed to initialized ensemble.")            

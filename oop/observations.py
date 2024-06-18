@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import numpy as np
 import pyPDAF.PDAF as PDAF
 from abc import ABC, abstractmethod
-from options import fNAN, iNAN
+from general import fNAN, iNAN, check_init
 
 class Observation(ABC):
     """
@@ -130,9 +130,16 @@ class Observation(ABC):
             time as value. 
             
         """
-        self.windows = windows
+        self.windows = {}
+        odata = self.read_obs()
+        #Filter out empty windows.
+        for wtime,window in windows.items():
+            in_window = np.logical_and(odata['time']>wtime+np.min(window),
+                                       odata['time']<=wtime+np.max(window))
+            if np.any(in_window):
+                self.windows = {**self.windows, wtime:window}
         
-    def create_windows_from_model(self, time_init, total_steps, dt):
+    def create_windows_from_model(self, time_init, final_step, dt):
         """
         Create observation windows matching model time steps.
 
@@ -142,9 +149,17 @@ class Observation(ABC):
             Model time step. 
             
         """
-        wtimes = np.arange(0, total_steps) * dt + time_init
-        windows = [(wtime,(0,dt)) for wtime in wtimes]
+        wtimes = np.arange(1, final_step+1) * dt + time_init
+        windows = [(wtime,(-dt,0)) for wtime in wtimes]
         self.create_windows(dict(windows))
+        
+    def next_obs_time(self, time_now):
+        """ 
+        Find first DA window after current time.
+        """
+        times = np.array([float(key) for key in self.windows])
+        times = times[times > time_now]
+        return np.min(times) if len(times)>0 else None
         
     @abstractmethod 
     def init(self, id, time):
@@ -158,23 +173,27 @@ class Observation(ABC):
             DA time. 
             
         """
-        
-    def _dummy_odata(self, ncoords=1, nstencil=1):
-        """ 
-        Dummy initialize in case no observations are present in window. 
-        """
-        y = np.zeros(1, order='F')
-        ocoords = np.ones((ncoords,1), dtype=float, order='F') * fNAN
-        stencil_index = np.zeros((nstencil,1), dtype=int, order='F') 
-        stencil_weight = np.zeros((nstencil,1), dtype=float, order='F') 
-        inverse_var = np.zeros(1, order='F', dtype=float) 
-
-        return y, ocoords, inverse_var, stencil_index, stencil_weight
+            
+    def _check_odata(self, odata):
+        """ Check whether all required fields are present in observational data. """
+        #Collect missing fields. 
+        keys = set(['observed','coord','time','variance'])
+        keys = keys - set(odata.keys())
+         
+        #Create error message. 
+        msg = ""
+        for key in keys:
+            msg += f"Key {key} missing in the observational data for observation {self.obs_id}.\n"
+            
+        if len(keys)>0:
+            self.pe.throw_error(msg)
         
     def deallocate(self):
         """ Deallocate observations. """
-        PDAF.omi_deallocate_obs(self.obs_id)
-        self.is_initialized = False
+        if self.is_initialized:
+            PDAF.omi_deallocate_obs(self.obs_id)
+            self.dim_obs = 0
+            self.is_initialized = False
         
 class PointObservation(Observation):
     """ 
@@ -182,7 +201,7 @@ class PointObservation(Observation):
     
     Methods
     -------
-    obs_reader : function 
+    read_obs : function 
         Function that reads observations for this time. 
     interpolator : function 
         Given geographic coordinates, retrieve indices and weights in state_p. 
@@ -205,6 +224,10 @@ class PointObservation(Observation):
             Given geographic coordinates, retrieve indices and weights in state_p. 
         obs_covariance : covariances.ObsCoveriance object 
             Object representing observational error covariance including localization. 
+        time : float 
+            Time for which observation operator was intialized. 
+        is_initialized : bool 
+            Bool indicating that observation operator was initialized. 
             
         """
         self.doassim = True
@@ -212,65 +235,87 @@ class PointObservation(Observation):
         self.read_obs = obs_reader
         self.interpolator = interpolator
         self.covariance = obs_covariance 
+        self.is_initialized = False
     
+    @check_init
     def obs_op(self, state_p, ostate=None):
-        #if not np.isclose(time, self.last_initialized):
-        #    self.pe.throw_error(f"Observation operator for time {time} not yet initialized.")
+        
         if self.doassim and ostate is None:
             ostate = np.zeros((self.dim_obs,), dtype=float, order='F')
         if self.doassim:
-            print('IP',np.shape(state_p))
-            return PDAF.omi_obs_op_gridpoint(self.obs_id, state_p, ostate)
+            ostate = PDAF.omi_obs_op_gridpoint(self.obs_id, state_p, ostate)
+        return ostate
         
     def init(self, id, time):
         #Numerical index of this observation operator. Must be >=1.
         self.obs_id = id
+        self.dim_obs = 0 
+        self.time = time 
         #Select observation in this observation window. 
+        odata = {'observed':np.array([],dtype=float), 'coord':np.array([],dtype=float),
+                 'stencil_index':np.array([],dtype=int),'stencil_weight':np.array([],dtype=float),
+                }
         matches = [wtime for wtime in self.windows.keys() if np.isclose(wtime,time)]
-        if len(matches)==1:
+        if len(matches)==0:
+            n_coord, n_stencil = 1,1
+        elif len(matches)==1:
             window = matches[0] + np.array(self.windows[matches[0]])
             #Read observations. 
             odata = self.read_obs(window)
-            stencil_index, stencil_weight = self.interpolator(odata['coord'])
-            self.stencil_shape = (np.size(odata['coord'],1), np.size(stencil_weight,1)) #C-order
-            #Count how many points on this comm_filter.
-            in_p = np.sum(stencil_weight, axis=1) > 0
+            self._check_odata(odata)
+            
+            #Determine indices in state_p and weights of observation functional.
+            odata['stencil_index'], odata['stencil_weight'] = self.interpolator(odata['coord'])
+            n_coord, n_stencil = np.size(odata['coord'],1), np.size(odata['stencil_index'],1)
+            in_p = np.any(odata['stencil_weight']!=0.0, axis=1)
             for key in odata:
                 odata[key] = odata[key][in_p]
-            self.stencil_index = stencil_index[in_p]
-            self.stencil_weight = stencil_weight[in_p]
-            self.ocoords = odata['coord']
         else:
             self.pe.throw_error("For each time at most 1 observation window may be defined.")
             
-        #Find interpolation stencil and determine which observations are on this comm_filter
-        if len(matches)==0: 
-            y, ocoords, inverse_var, stencil_index, stencil_weight = self._dummy_odata()
-        elif sum(in_p)==0:
-            y, ocoords, inverse_var, stencil_index, stencil_weight = self._dummy_odata(*self.stencil_shape)
+        #Save values in this object. 
+        for key in ['observed','coord','stencil_index','stencil_weight']:
+            setattr(self, key, odata[key])
+        self.covariance.init(self.time, **odata)
+        
+        #Pass on to Fortran
+        if len(odata['observed'])==0:
+            odata = {'observed':np.ones((1,))*fNAN, 'coord':np.ones((1,n_coord)) * fNAN,
+                     'stencil_index':np.zeros((1,n_stencil)),'stencil_weight':np.zeros((1,n_stencil)),
+                    }
+            inv_variance = np.zeros((1,)) 
         else:
-            y = np.asfortranarray(odata['value'], dtype=float)
-            ocoords = np.asfortranarray(odata['coord'].T, dtype=float)
-            stencil_index = np.asfortranarray(stencil_index.T, dtype=int) + 1
-            stencil_weight = np.asfortranarray(stencil_weight.T, dtype=float)
-            inverse_var = np.asfortranarray(1./odata['variance'], dtype=float)
+            inv_variance = 1./self.covariance.variance
             
         #Pass everything on to the Fortran code. 
         PDAF.omi_set_doassim(self.obs_id, int(self.doassim and len(matches)>0))
         PDAF.omi_set_disttype(self.obs_id, int(self.covariance.localizer.projection))
-        PDAF.omi_set_ncoord(self.obs_id, np.size(ocoords, 0))
-        PDAF.omi_set_id_obs_p(self.obs_id, stencil_index)
-        PDAF.omi_set_icoeff_p(self.obs_id, stencil_weight)
+        PDAF.omi_set_ncoord(self.obs_id, n_coord)
+        PDAF.omi_set_id_obs_p(self.obs_id, np.asfortranarray(odata['stencil_index'].T, dtype=int)+1)
+        PDAF.omi_set_icoeff_p(self.obs_id, np.asfortranarray(odata['stencil_weight'].T, dtype=float))
         PDAF.omi_set_obs_err_type(self.obs_id, int(self.covariance.error_family)) 
         PDAF.omi_set_use_global_obs(self.obs_id, int(self.covariance.localizer.cutoff_radius < 0.))
         #TODO: PDAF.omi_set_domainsize(self.obs_id, self.domainsize)
         
-        print('IP',np.shape(y),np.shape(inverse_var),np.shape(ocoords),
-              np.shape(stencil_index),np.shape(stencil_weight))
-        self.dim_obs = PDAF.omi_gather_obs(self.obs_id, y, inverse_var, ocoords, 
+        self.dim_obs = PDAF.omi_gather_obs(self.obs_id, np.asfortranarray(odata['observed'],dtype=float), 
+                                           np.asfortranarray(inv_variance, dtype=float), 
+                                           np.asfortranarray(odata['coord'].T,dtype=float), 
                                            self.covariance.localizer.cutoff_radius)
+        
+        self.is_initialized = True
       
         return self.dim_obs
+
+class ObsReader(ABC):
+    """ Abstract class to deal with reading observational data. """
+    
+    @abstractmethod 
+    def read(self, window):
+        """ Return observations in time window. """
+        
+    @abstractmethod 
+    def times(self):
+        """ Retrieve all times for which observations are available. """
 
 class DictObsReader:
     """
@@ -283,344 +328,19 @@ class DictObsReader:
 
     """
     
-    def __init__(self, data):
+    def __init__(self, pe, data):
         """ Constructor. """
+        self.pe = pe
         self.data = data
         
-    def __call__(self, window):
-        """ Return observations in time window. """
+    def __call__(self, window=None):
+        """ Read observations in window. """
+        #Times 
         times = self.data['time']
-        in_window = np.logical_and(times>=min(window), times<max(window))
+        if window is None:
+            return {'time':times}
+
+        in_window = np.logical_and(times>min(window), times<=max(window))
         return dict([(key,value[in_window]) for key, value in self.data.items()])
     
-class DepreciatedOBS:
-    """observation information and user-supplied routines
-
-    Attributes
-    ----------
-    delt_obs : int
-        time step interval for observations
-    dim_obs : int
-        dimension size of the observation vector
-    dim_obs_p : int
-        dimension size of the PE-local observation vector
-    disttype : int
-        type of distance computation to use for localization
-    doassim : int
-        whether to assimilate this observation type
-    domainsize : ndarray
-        size of domain for periodicity (<=0 for no periodicity)
-    i_obs : int
-        index of the observation type
-    icoeff_p : ndarray
-        2d array for interpolation coefficients for obs. operator
-    id_obs_p : ndarray
-        indices of process-local observed field in state vector
-    ivar_obs_p : ndarray
-        vector of process-local inverse observation error variance
-    n_obs : int
-        number of observation types
-    ncoord : int
-        number of coordinate dimension
-    nrows : int
-        number of rows in ocoord_p
-    obs_err_type : int
-        type of observation error
-    obs_p : ndarray
-        vector of process-local observations
-    ocoord_p : ndarray
-        2d array of process-local observation coordinates
-    rms_obs : float
-        observation error standard deviation (for constant errors)
-    use_global_obs : int
-       Whether to use (1) global full obs. or
-       (0) obs. restricted to those relevant for a process domain
-    """
-
-    n_obs = 0
-
-    def __init__(self, typename, mype_filter,
-                 nx, doassim, delt_obs, rms_obs):
-        """constructor
-
-        Parameters
-        ----------
-        typename : string
-            name of the observation type
-        mype_filter : int
-            rank of the PE in filter communicator
-        nx : ndarray
-            grid size of the model domain
-        doassim : int
-            whether to assimilate this observation type
-        delt_obs : int
-            time step interval for observations
-        rms_obs : float
-            observation error standard deviation (for constant errors)
-        """
-        OBS.n_obs += 1
-
-        self.i_obs = OBS.n_obs
-
-        assert OBS.n_obs >= 1, 'observation count must start from 1'
-
-        if (mype_filter == 0):
-            print(('Assimilate observations:', typename))
-
-        self.doassim = doassim
-        self.delt_obs = delt_obs
-        self.rms_obs = rms_obs
-
-        # Specify type of distance computation
-        # 0=Cartesian 1=Cartesian periodic
-        self.disttype = 0
-
-        # Number of coordinates used for distance computation
-        # The distance compution starts from the first row
-        self.ncoord = len(nx)
-
-        # Allocate process-local index array
-        # This array has as many rows as required
-        # for the observation operator
-        # 1 if observations are at grid points;
-        # >1 if interpolation is required
-        self.nrows = 1
-
-        # Size of domain for periodicity for disttype=1
-        # (<0 for no periodicity)
-        if self.i_obs == 1:
-            self.domainsize = np.zeros(self.ncoord)
-            self.domainsize[0] = nx[1]
-            self.domainsize[1] = nx[0]
-        else:
-            self.domainsize = None
-
-        # Type of observation error: (0) Gauss, (1) Laplace
-        self.obs_err_type = None
-
-        # Whether to use (1) global full obs.
-        # (0) obs. restricted to those relevant for a process domain
-        self.use_global_obs = 1
-
-        self.icoeff_p = None
-
-    def init_dim_obs(self, step, dim_obs, local_range,
-                     mype_filter, nx, nx_p):
-        """intialise PDAFomi and getting dimension of observation vector
-
-        Parameters
-        ----------
-        step : int
-            current time step
-        dim_obs : int
-            dimension size of the observation vector
-        local_range : float
-            range for local observation domain
-        mype_filter : int
-            rank of the PE in filter communicator
-        nx : ndarray
-            integer array for grid size
-        nx_p : ndarray
-            integer array for PE-local grid size
-        """
-        obs_field = self.get_obs_field(step, nx)
-
-        # Count valid observations that
-        # lie within the process sub-domain
-        pe_start = nx_p[-1]*mype_filter
-        pe_end = nx_p[-1]*(mype_filter+1)
-        obs_field_p = obs_field[:, pe_start:pe_end]
-        assert tuple(nx_p) == obs_field_p.shape, \
-               'observation decomposition should be the same as' \
-               ' the model decomposition'
-        cnt_p = np.count_nonzero(obs_field_p > -999.0)
-        self.dim_obs_p = cnt_p
-
-        # Initialize vector of observations on the process sub-domain
-        # Initialize coordinate array of observations
-        # on the process sub-domain
-        if self.dim_obs_p > 0:
-            self.set_obs_p(nx_p, obs_field_p)
-            self.set_id_obs_p(nx_p, obs_field_p)
-            self.set_ocoord_p(obs_field_p, pe_start)
-            self.set_ivar_obs_p()
-        else:
-            self.obs_p = np.zeros(1)
-            self.ivar_obs_p = np.zeros(1)
-            self.ocoord_p = np.zeros((self.ncoord, 1))
-            self.id_obs_p = np.zeros((self.nrows, 1))
-
-        self.set_PDAFomi(local_range)
-
-    def set_obs_p(self, nx_p, obs_field_p):
-        """set up PE-local observation vector
-
-        Parameters
-        ----------
-        nx_p : ndarray
-            PE-local model domain
-        obs_field_p : ndarray
-            PE-local observation field
-        """
-        obs_field_tmp = obs_field_p.reshape(np.prod(nx_p), order='F')
-        self.obs_p = np.zeros(self.dim_obs_p)
-        self.obs_p[:self.dim_obs_p] = obs_field_tmp[obs_field_tmp > -999]
-
-    def set_id_obs_p(self, nx_p, obs_field_p):
-        """set id_obs_p
-
-        Parameters
-        ----------
-        nx_p : ndarray
-            PE-local model domain
-        obs_field_p : ndarray
-            PE-local observation field
-        """
-        self.id_obs_p = np.zeros((self.nrows, self.dim_obs_p))
-        obs_field_tmp = obs_field_p.reshape(np.prod(nx_p), order='F')
-        cnt0_p = np.where(obs_field_tmp > -999)[0] + 1
-        assert len(cnt0_p) == self.dim_obs_p, 'dim_obs_p should equal cnt0_p'
-        self.id_obs_p[0, :self.dim_obs_p] = cnt0_p
-
-    def set_ocoord_p(self, obs_field_p, offset):
-        """set ocoord_p
-
-        Parameters
-        ----------
-        obs_field_p : ndarray
-            PE-local observation field
-        offset : int
-            PE-local offset starting from rank 0
-        """
-        self.ocoord_p = np.zeros((self.ncoord, self.dim_obs_p))
-        ix, iy = np.where(obs_field_p.T > -999)
-        self.ocoord_p[0, :self.dim_obs_p] = ix + 1 + offset
-        self.ocoord_p[1, :self.dim_obs_p] = iy + 1
-
-    def set_ivar_obs_p(self):
-        """set ivar_obs_p
-        """
-        self.ivar_obs_p = np.ones(
-                                self.dim_obs_p
-                                )/(self.rms_obs*self.rms_obs)
-
-    def get_obs_field(self, step, nx):
-        """retrieve observation field
-
-        Parameters
-        ----------
-        step : int
-            current time step
-        nx : ndarray
-            grid size of the model domain
-
-        Returns
-        -------
-        obs_field : ndarray
-            observation field
-        """
-        obs_field = np.zeros(nx)
-        if self.i_obs == 1:
-            obs_field = np.loadtxt(f'inputs_online/obs_step{step}.txt')
-        else:
-            obs_field = np.loadtxt(f'inputs_online/obsB_step{step}.txt')
-        return obs_field
-
-    def set_PDAFomi(self, local_range):
-        """set PDAFomi obs_f object
-
-        Parameters
-        ----------
-        local_range : double
-            lcalization radius (the maximum radius used in this process domain)
-        """
-        print (self.obs_p)
-        PDAF.omi_set_doassim(self.i_obs, self.doassim)
-        PDAF.omi_set_disttype(self.i_obs, self.disttype)
-        PDAF.omi_set_ncoord(self.i_obs, self.ncoord)
-        PDAF.omi_set_id_obs_p(self.i_obs, self.id_obs_p)
-        if self.domainsize is not None:
-            PDAF.omi_set_domainsize(self.i_obs, self.domainsize)
-        if self.obs_err_type is not None:
-            PDAF.omi_set_obs_err_type(self.i_obs, self.obs_err_type)
-        if self.use_global_obs is not None:
-            PDAF.omi_set_use_global_obs(self.i_obs, self.use_global_obs)
-        if self.icoeff_p is not None:
-            PDAF.omi_set_icoeff_p(self.i_obs, self.icoeff_p)
-
-        self.dim_obs = PDAF.omi_gather_obs(self.i_obs,
-                                          self.obs_p,
-                                          self.ivar_obs_p,
-                                          self.ocoord_p,
-                                          local_range)
-
-    def obs_op(self, step, state_p, ostate):
-        """convert state vector by observation operator
-
-        Parameters
-        ----------
-        step : int
-            current time step
-        state_p : ndarray
-            PE-local state vector
-        ostate : ndarray
-            state vector transformed by identity matrix
-        """
-        if (self.doassim == 1):
-            ostate = PDAF.omi_obs_op_gridpoint(self.i_obs, state_p, ostate)
-        return ostate
-
-    def init_dim_obs_l(self, localization, domain_p, step, dim_obs, dim_obs_l):
-        """intialise local observation vector
-
-        Parameters
-        ----------
-        localization : TYPE
-            Description
-        domain_p : int
-            index of current local analysis domain
-        step : int
-            current time step
-        dim_obs : int
-            dimension of observation vector
-        dim_obs_l : int
-            dimension of local observation vector
-
-        Returns
-        -------
-        dim_obs_l : int
-            dimension of local observations
-        """
-        return PDAF.omi_init_dim_obs_l(self.i_obs, localization.coords_l,
-                                      localization.loc_weight,
-                                      localization.local_range,
-                                      localization.srange)
-
-    def localize_covar(self, localization, HP_p, HPH, coords_p):
-        """localze covariance matrix
-
-        Parameters
-        ----------
-        localization : `Localization.Localization`
-            the localization object
-        HP_p : ndarray
-            matrix HPH
-        HPH : ndarray
-            PE local part of matrix HP
-        coords_p : ndarray
-            coordinates of state vector elements
-        """
-        PDAF.omi_localize_covar(self.i_obs, localization.loc_weight,
-                               localization.local_range,
-                               localization.srange,
-                               coords_p, HP_p, HPH)
-
-    def deallocate_obs(self):
-        """deallocate PDAFomi object
-
-        Parameters
-        ----------
-        step : int
-            current time step
-        """
-        PDAF.omi_deallocate_obs(self.i_obs)
+    

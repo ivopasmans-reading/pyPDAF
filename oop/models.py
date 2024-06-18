@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 from abc import ABC, abstractmethod
 import numpy as np 
+from general import check_init
 
 class Model(ABC):
     """ 
@@ -50,6 +51,8 @@ class Model(ABC):
         Step at which model is initialized. 
     time_init : float 
         Time at which model is initialized. 
+    control : parallelization.ProcessControl 
+        Object controlling parallelization. 
     
     """
     
@@ -81,11 +84,17 @@ class Model(ABC):
         return int( (time - self.time_init) / self.dt )
     
     @abstractmethod
-    def init_fields(self):
+    @check_init
+    def init_fields(self, process_control):
         """
         Initialises model field at beginning of model run. 
         
         After this method step_init and time_init must be set. 
+        
+        Parameters
+        ----------
+        process_control : parallelization.ProcessControl 
+            Object containing information about processes used by this model. 
         """
     
     @abstractmethod 
@@ -167,6 +176,8 @@ class Ar1Model(Model):
         Correlation AR1 process spaced 1 spatial step apart. 
     seed : int 
         Seed for random number generation. 
+    is_initialized : bool
+        Flag indicating whether fields were created. 
         
     Methods 
     -------
@@ -177,10 +188,13 @@ class Ar1Model(Model):
         
     """
     
-    def __init__(self, dt, shape, var, corr, seed=None):
+    def __init__(self, dt, shape, var, corr, seed=None, save_steps=[]):
         self.dt = dt 
         self.shape = shape 
         self.par = (np.sqrt(var * (1-corr**2)), corr)
+        
+        self.save_steps = np.array(save_steps, dtype=int)
+        self.saved_output = np.empty((len(save_steps),)+tuple(self.shape), dtype=float)
         
         if seed is not None:
             np.random.seed(seed)
@@ -190,9 +204,10 @@ class Ar1Model(Model):
     def dim_state(self):
         return np.prod(self.shape)
         
-    def init_fields(self):
+    def init_fields(self, process_control):
         np.random.set_state(self.random_state)
         
+        self.control = process_control
         self.step_init, self.time_init, self.step = 0, 0.0, 0
         self.values = np.empty(self.shape, dtype=float)
         
@@ -202,8 +217,11 @@ class Ar1Model(Model):
         for n in range(np.size(self.values,0)):
             self.values[n] = np.roll(self.values[0], n)
             
+        self.save_output(self.step_init)
         self.random_state = np.random.get_state()
-            
+        self.is_initialized = True
+      
+    @check_init      
     def step_forward(self, step, steps_forward):   
         np.random.set_state(self.random_state)
         
@@ -216,15 +234,17 @@ class Ar1Model(Model):
             self.values[n] = np.roll(self.values[0], n)
             
         self.step += steps_forward
+        self.save_output(self.step)
         
         self.random_state = np.random.get_state()
         
     def collect_state_pdaf(self, dim_p, state_p):
-        self.values = np.reshape(state_p, self.shape)
+        state_p = np.reshape(self.values, (-1,))
         return state_p
         
     def distribute_state_pdaf(self, dim_p, state_p):
-        return np.reshape(self.values, (-1,))
+        self.values = np.reshape(state_p, self.shape)
+        return state_p
     
     def nn_interpolator(self, coords):
         coords  = np.array(np.round(coords), dtype=int)
@@ -234,129 +254,10 @@ class Ar1Model(Model):
         weights = np.where(np.logical_and(indices>=0, indices<self.dim_state),
                            weights, 0.0)
         return indices, weights
-        
-
-
-# class Ar1Model(Model):
     
-#     def __init__(self, nx, nt, comm_controller, 
-#                  parameters=np.array([1.0])):
-#         self.set_attributes(nt, nx, nx)
-#         self.comm = comm_controller 
-#         self.ar = self.parameters
+    def save_output(self, step):
+        matches = np.where(step==self.save_steps)[0]
+        for n in matches:
+            self.saved_output[n] = self.values
         
-#     def init_field(self):
-#         self.field_p = np.random.normal(size=np.shape(self.field_p), scale=self.ar[0])
-#         for n in range(1, np.size(self.field_p,0)):
-#             self.field_p[n] = ar[1] * self.field_p[n-1] + np.sqrt(1-ar[1]**2) * self.field_p[n]
-    
-#     def step(self, step, use_pdaf):
-#         self.field = np.roll(self.field, 1, axis=0)
-#         return self.field
         
-      
-
-
-# class OldModel:
-
-#     """Model information in PDAF
-
-#     Attributes
-#     ----------
-#     field_p : ndarray
-#         PE-local model field
-#     nx : ndarray
-#         integer array for grid size
-#     nx_p : ndarray
-#         integer array for PE-local grid size
-#     total_steps : int
-#         total number of time steps
-#     """
-
-#     def __init__(self, nx, nt, pe):
-#         """constructor
-
-#         Parameters
-#         ----------
-#         nx : ndarray
-#             integer array for grid size
-#         nt : int
-#             total number of time steps
-#         pe : `parallelization.parallelization`
-#             parallelization object
-#         """
-#         # model size
-#         self.nx = list(nx)
-#         # model size for each CPU
-#         self.get_nxp(pe)
-#         # model time steps
-#         self.total_steps = nt
-
-#     def get_nxp(self, pe):
-#         """Compute local-PE domain size/domain decomposition
-
-#         Parameters
-#         ----------
-#         pe : `parallelization.parallelization`
-#             parallelization object
-#         """
-#         self.nx_p = copy.copy(self.nx)
-
-#         try:
-#             assert self.nx[-1] % pe.npes_model == 0
-#             self.nx_p[-1] = self.nx[-1]//pe.npes_model
-#         except AssertionError:
-#             print((f'...ERROR: Invalid number of'
-#                    f'processes: {pe.npes_model}...'))
-#             pe.abort_parallel()
-
-#     def init_field(self, filename, mype_model):
-#         """initialise PE-local model field
-
-#         Parameters
-#         ----------
-#         filename : string
-#             input filename
-#         mype_model : int
-#             rank of the process in model communicator
-#         """
-#         # model field
-#         self.field_p = np.zeros(self.nx_p)
-#         offset = self.nx_p[-1]*mype_model
-#         self.field_p = np.loadtxt(
-#                                     filename
-#                                     )[:, offset:self.nx_p[-1] + offset]
-
-#     def step(self, pe, step, USE_PDAF):
-#         """step model forward
-
-#         Parameters
-#         ----------
-#         pe : `parallelization.parallelization`
-#             parallelization object
-#         step : int
-#             current time step
-#         USE_PDAF : bool
-#             whether PDAF is used
-#         """
-#         model.shift.step(self, pe, step, USE_PDAF)
-
-#     def printInfo(self, USE_PDAF, pe):
-#         """print model info
-
-#         Parameters
-#         ----------
-#         USE_PDAF : bool
-#             whether PDAF is used
-#         pe : `parallelization.parallelization`
-#             parallelization object
-#         """
-#         do_print = USE_PDAF and pe.mype_model == 0
-#         do_print = do_print or \
-#             (pe.task_id == 1 and pe.mype_model == 0 and not USE_PDAF)
-#         if do_print:
-#             print('MODEL-side: INITIALIZE PARALLELIZED Shifting model MODEL')
-#             print(f'Grid size: {self.nx}')
-#             print(f'Time steps {self.total_steps}')
-#             print(f'-- Domain decomposition over {pe.npes_model} PEs')
-#             print(f'-- local domain sizes (nx_p): {self.nx_p}')

@@ -1,8 +1,32 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass 
-from options import fNAN, iNAN, FilterType
+from dataclasses import dataclass, field
+from general import fNAN, iNAN, check_init
+from enum import IntEnum
 import pyPDAF.PDAF as PDAF
 import numpy as np
+from parallelization import ProcessControl
+from covariances import Covariance
+from inflation import Inflator
+
+class FilterType(IntEnum):
+    """
+    Filter options for PDAF. 
+    """
+    seek = 0
+    seik = 1 
+    enkf = 2
+    lseik = 3
+    etkf = 4 
+    letkf = 5
+    estkf = 6 
+    lestkf = 7 
+    local_enkf = 8 
+    netf = 9 
+    lnetf = 10 
+    lknetf = 11 
+    pf = 12 
+    genobs = 100 
+    var3d = 200 
 
 def identity_state_pdaf(dim_p, state_p):
     """
@@ -29,26 +53,50 @@ class Analyzer(ABC):
     
     Attributes
     ----------
+    pe : parallelization.ProcessControl
+        Object that controls parallelization in the filter. 
+    covariance : covariances.Covariance 
+        Object representing error covariance. 
     filtertype : int>0 
         Integer indicating type of filter. 
     subtype : int>=0
         Subtype
+    prestep : list 
+        List of functions to be applied just before DA. 
+    poststep : list 
+        List of functions to be applied just after DA.
     param_i : list of int 
         Filter parameters that are integers. 
     param_r : list of float 
         Filter parameters that are floats. 
     
     """
+    pe : ProcessControl
+    covariance : Covariance
+    inflator : Inflator
     filtertype : FilterType
     subtype : int 
-    param_i : list[int]
-    param_r : list[float]
-    
-    @abstractmethod 
-    def check_settings(self):
-        """ Check whether the attributes are valid for class. """
+    presteps : list = field(default_factory=lambda:[])
+    poststeps : list = field(default_factory=lambda:[])
+    param_i : np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=int))
+    param_r : np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    is_initialized : bool = False
         
     @abstractmethod 
+    def build(self, das, model):
+        """ 
+        Add different user-defined functions to analyzer.
+        
+        Parameters 
+        ----------
+        das : dasystems.DAS object 
+            Object containing all information about DA system. 
+        model : list of models.Model object
+            Different models using this comm_model. 
+            
+        """
+       
+    @check_init 
     def get_state(self, doexit, status_pdaf):
         """ Copy state from ensemble storage to input model. 
         
@@ -67,8 +115,12 @@ class Analyzer(ABC):
             Status PDAF system. 
         
         """
+        steps_forward = iNAN                
+        return PDAF.get_state(steps_forward, doexit, self.u_next_observation, 
+                              self.u_distribute_state, self.u_prepoststep, status_pdaf)
         
     @abstractmethod 
+    @check_init
     def put_state(self, doexit, status_pdaf):
         """ 
         Copy output from model to ensemble storage. 
@@ -89,6 +141,7 @@ class Analyzer(ABC):
         
         """
         
+    @check_init
     def u_prepoststep(self, step, dim_p, dim_ens, dim_ens_p, dim_obs_p, 
                       state_p, Uinv, ens_p, status_pdaf):
         """ 
@@ -127,30 +180,45 @@ class Analyzer(ABC):
             PDAF status. 
             
         """
+        assert np.shape(state_p)==(dim_p,)
+        assert np.shape(ens_p)==(dim_p,dim_ens_p)
+        assert np.shape(Uinv)==(dim_ens-1,dim_ens-1)
+        
         if step<0:
-            return self.u_prestep(step, dim_p, dim_ens, dim_ens_p, dim_obs_p, 
-                                  state_p, Uinv, ens_p, status_pdaf)
+            for prestep in self.presteps:
+                state_p, Uinv, ens_p, status_pdaf = prestep(step, state_p, Uinv, ens_p, status_pdaf)
         else:
-            return self.u_poststep(step, dim_p, dim_ens, dim_ens_p, dim_obs_p, 
-                                   state_p, Uinv, ens_p, status_pdaf)
+            for poststep in self.poststeps:
+                state_p, Uinv, ens_p, status_pdaf = poststep(step, state_p, Uinv, ens_p, status_pdaf)
+                
+        return state_p, Uinv, ens_p
         
-class EnsembleGlobalFilter(Analyzer):
-    """ Ensemble Kalman filters. """
+class ETKF(Analyzer):
+    """ Ensemble Transform Kalman filter. """
     
-    def check_settings(self):
-        #TODO: implement checks. 
-        pass
+    def __init__(self, pe, covariance, inflator, presteps=[], poststeps=[]):
+        super().__init__(pe, covariance, inflator,
+                         FilterType.etkf, 0, presteps=presteps, poststeps=poststeps)
         
-    def get_state(self, doexit, status_pdaf):
-        steps_forward, time_now = iNAN, fNAN                  
-        return PDAF.get_state(steps_forward, time_now, doexit, self.u_next_observation_pdaf, 
-                              self.u_distribute_state_pdaf, self.u_prepoststep, status_pdaf)
-        
+    @check_init
     def put_state(self, doexit, status_pdaf):
-        return PDAF.put_state_global(self.u_collect_state_pdaf, self.u_init_dim_obs,
-                                     self.u_obs_op, self.u_prepoststep, status_pdaf)
+        return PDAF.put_state_etkf(self.u_collect_state, self.u_init_dim_obs,
+                                   self.u_obs_op, self.u_init_obs, self.u_prepoststep, 
+                                   self.u_prodRinvA, self.u_init_obsvar)
+ 
+    def build(self, das, model):
+        builder = das.builder
+        self.u_collect_state = builder.build_collect_state(das, model)
+        self.u_distribute_state = builder.build_distribute_state_init(das, model)
+        self.u_init_dim_obs = builder.build_init_dim_obs(das, model)
+        self.u_obs_op = builder.build_obs_op(das, model)
+        self.u_init_obs = builder.build_init_obs(das, model)
+        self.u_prodRinvA = builder.build_prodRinvA(das, model)
+        self.u_init_obsvar = builder.build_init_obsvar(das, model)
+        self.u_next_observation = builder.build_next_observation(das, model)  
+        self.is_initialized = True
         
-class AnalyzerBuilder(ABC):
+class AnalyzerBuilder:
     """ 
     Object to create a DA analyzer. 
     
@@ -163,60 +231,14 @@ class AnalyzerBuilder(ABC):
     build
         Add different user-defined functions to analyzer.
     """
-    
-    @abstractmethod 
-    def construct_analyzer(self):
-        """ Create new analyzer and store in builder. """
             
-    def get_analyzer(self):
-        """" Collect the analyzer stored in builder. """
-        return self.analyzer
-    
-    def build(self, model, observations, final_step):
-        """ 
-        Add different user-defined functions to analyzer.
-        
-        Parameters 
-        ----------
-        model : list of models.Model object
-            Different models using this comm_model. 
-        observations : list of observations.Obs objects
-            Observation operators. 
-        final_step : int 
-            Last model step to be taken by DA system. 
-            
-        """
-        self.analyzer.u_prestep = self.build_prestep(model, observations, final_step)
-        self.analyzer.u_poststep = self.build_poststep(model, observations, final_step)
-        
-        self.analyzer.u_next_observation_pdaf = self.build_next_observation_pdaf(model, observations, final_step)
-        self.analyzer.u_dim_obs_pdafomi = self.build_dim_obs_pdafomi(model, observations, final_step)
-        self.analyzer.obs_op_pdafomi = self.build_obs_op_pdafomi(model, observations, final_step)
-        
-    def build_prestep(self, model, observations, steps_left):
-        """ Build u_prestep. """
-        
-        def u_prestep(step, dim_p, dim_ens, dim_ens_p, dim_obs_p, 
-                      state_p, Uinv, ens_p, status_pdaf):
-            """ See u_prepoststep. """
-            return state_p, Uinv, ens_p, status_pdaf
-        
-        return u_prestep
-        
-    def build_poststep(self, model, observations, steps_left):
-        """ Build u_poststep. """
-        
-        def u_poststep(step, dim_p, dim_ens, dim_ens_p, dim_obs_p, 
-                       state_p, Uinv, ens_p, status_pdaf):
-            """ See u_prepoststep """
-            return state_p, Uinv, ens_p, status_pdaf
-        
-        return u_poststep
-        
-    def build_collect_state_pdaf(self, model, observations, steps_left):
+    def build_collect_state(self, das, model):
         return model.collect_state_pdaf
         
-    def build_distribute_state_pdaf(self, model, observations, steps_left):
+    def build_distribute_state(self, das, model):
+        return model.distribute_state_pdaf 
+    
+    def build_distribute_state_init(self, das, model):
         #Don't overwrite initial conditions!
         if model.step == model.step_init:
             distribute_state_pdaf = identity_state_pdaf
@@ -224,7 +246,7 @@ class AnalyzerBuilder(ABC):
             distribute_state_pdaf = model.distribute_state_pdaf
         return distribute_state_pdaf
     
-    def build_next_observation_pdaf(self, model, observations, final_step):
+    def build_next_observation(self, das, model):
         """ Build function u_next_observation_pdaf. """
         
         def u_next_observation_pdaf(step_now, nsteps, doexit, time_now):
@@ -253,24 +275,29 @@ class AnalyzerBuilder(ABC):
                 Current model time. 
             
             """
-            #Maximum number of steps left 
-            nsteps = final_step - step_now 
-        
+            #Steps to end simulation. 
+            nsteps = das.final_step - step_now
+            
             #Find the number of steps to next observation. 
             time_now = model.step2time(step_now)
-            next_times = [obs.next_obs_time(time_now) for obs in observations if obs.next_obs_time(time_now) is not None]
-            if len(next_times)>0:
-                next_time = np.min(next_times)
-                nsteps = min(nsteps, model.time2step(next_time) - step_now)
+            next_times = [obs.next_obs_time(time_now) for obs in das.observations if obs.next_obs_time(time_now) is not None]
             
-            doexit = bool(doexit) or nsteps <= 0
-            doexit = int(doexit)
+            if len(next_times)==0:
+                nsteps = 99999999
+            else:
+                next_time = np.min(next_times)
+                nsteps = model.time2step(next_time) - step_now
+                #doexit = model.time2step(next_time) > das.final_step
         
+            #nsteps = nsteps if doexit else model.time2step(next_time)-step_now
+            doexit = False
+            doexit = int(doexit)
+            
             return nsteps, doexit, time_now
         
         return u_next_observation_pdaf
     
-    def build_dim_obs_pdafomi(self, model, observations, steps_left):
+    def build_init_dim_obs(self, das, model):
         
         def u_init_dim_obs_pdafomi(step, dim_obs):
             """
@@ -291,18 +318,21 @@ class AnalyzerBuilder(ABC):
             """ 
             time_now = model.step2time(step)
             
-            for n,obs in enumerate(observations):
+            for n,obs in enumerate(das.observations):
                 obs.init(n+1, time_now)
             
-            return np.sum([obs.dim_obs for obs in observations if obs.doassim])
+            dim_obs = np.sum([obs.dim_obs for obs in das.observations if obs.doassim])
+            return dim_obs
         
         return u_init_dim_obs_pdafomi
     
-    def build_obs_op_pdafomi(self, model, observations, steps_left):
+    def build_obs_op(self, das, model):
         
         def u_obs_op_pdafomi(step, dim_p, dim_obs_p, state_p, ostate):
             """
-            Turn state vector to observation vector. 
+            Turn state vector to observation vector.
+            
+            Observation operators should have initialized at this time.
 
             Parameters
             ----------
@@ -319,75 +349,111 @@ class AnalyzerBuilder(ABC):
                 Observation vector. 
             
             """
+            assert len(state_p)==dim_p
+            assert len(ostate)==dim_obs_p
             time_now = model.step2time(step)
         
-            for obs in observations:
-                ostate = obs.obs_op(time_now, state_p)
-            
+            s = slice(0,0)
+            for obs in das.observations:
+                s = slice(s.stop, s.stop+obs.dim_obs)
+                ostate = obs.obs_op(state_p, ostate)
+                
             return ostate
         
         return u_obs_op_pdafomi
     
-class EnsembleGlobalBuilder(AnalyzerBuilder):
-    """ 
-    Builder to create one of the global ensemble filters. 
-    
-    Attributes
-    ----------
-    filtertype : int>0 
-        Integer indicating type of filter. 
-    subtype : int>=0
-        Subtype
-    param_i : list of int 
-        Filter parameters that are integers. 
-    param_r : list of float 
-        Filter parameters that are floats. 
-
-    """
-    
-    def __init__(self, filtertype, subtype, param_i, param_r):
-        self.filtertype = filtertype 
-        self.subtype = subtype 
-        self.param_i = param_i 
-        self.param_r = param_r
-    
-    def construct_analyzer(self):
-        self.analyzer = EnsembleGlobalFilter(self.filtertype, self.subtype, self.param_i, self.param_r)
-    
-    def build(self, model, observations, final_step):
-        self.super().build(model, observations, final_step)
-        self.analyzer.u_collect_state_pdaf = self.build_collect_state_pdaf(model, observations, final_step)
-        self.analyzer.u_distribute_state_pdaf = self.build_distribute_state_pdaf(model, observations, final_step)
+    def build_init_obs(self, das, model):
         
-    
-    # def build_dim_obs_l_pdafomi(self, model, observations, steps_left):
+        def u_init_obs_pdafomi(step, dim_obs_p, obs_p):
+            """ 
+            It has to provide the vector of observations in observation_p for the current time step. 
+            """
+            obs_p = np.array([], dtype=float)
+            for obs in das.observations:
+                obs_p = np.append(obs_p, obs.observed)
+            assert len(obs_p)==dim_obs_p
+            return np.asfortranarray(obs_p, dtype=float)
         
-    #     def init_dim_obs_l_pdafomi(domain_p, step, dim_obs, dim_obs_l):
-    #         """
-    #         Initialise local observation dimension.
-
-    #         Parameters
-    #         ----------
-    #         domain_p : int
-    #             Index of current local analysis domain.
-    #         step : int
-    #             Current time step.
-    #         dim_obs : int
-    #             Dimension of observation vector.
-    #         dim_obs_l : int
-    #             Dimension of local observation vector.
+        return u_init_obs_pdafomi
             
-    #         Returns 
-    #         -------
-    #         dim_obs : 
-    #             Size of observation vector. 
-    #         dim_obs_l : int 
-    #             Dimension of local observation vector. 
-            
-    #         """
-    #         time_now = model.step2time(step)
-    #         dim_obs = np.sum([obs.dim_obs(time_now) for obs in observations])
-    #         dim_obs_l = np.sum([obs.(time_now, domain_p) for obs in observations])
-    #         return dim_obs, dim_obs_l
+    def build_prodRinvA(self, das, model):
         
-    #     return init_dim_obs_l_pdafomi
+        def u_prodRinvA_pdaf(step, dim_obs_p, dim_ens, obs_p, A_p, C_p=None):
+            """
+            In the algorithms the product of the inverse of the observation error covariance 
+            matrix with some matrix has to be computed.
+            
+            The interface has a difference for SEIK and ETKF: For ETKF the third argument is the ensemble
+            size (dim_ens), while for SEIK it is the rank of the covariance matrix (usually ensemble size minus one).
+            In addition, the second dimension of A_p and C_p has size dim_ens for ETKF, while it is rank for the SEIK filter. 
+            (Practically, one can usually ignore this difference as the fourth argument of the interface can be named 
+            arbitrarily in the routine.) 
+            
+            Parameters
+            ----------
+            step : int 
+                Current time step 
+            dim_obs_p : int 
+                Size observation vector on this process. 
+            dim_ens : int 
+                Number of ensemble members. 
+            obs_p : (dim_obs_p,) ndarray 
+                Observed values on this process. 
+            A_p : (dim_obs_p, dim_ens) ndarray 
+                Input matrix. 
+            C_p : (dim_obs_p, dim_ens) ndarray 
+                Output matrix. 
+                
+            Returns
+            -------
+            C_p : (dim_obs_p, dim_ens) ndarray 
+                Output matrix. 
+                
+            """
+            if C_p is None:
+                C_p = np.ones((dim_obs_p,np.size(A_p,1)), dtype=float, order='F') * fNAN
+            
+            s = slice(0,0)
+            for obs in das.observations:
+                s = slice(s.stop, s.stop+obs.dim_obs)
+                Rinv = obs.covariance.inverse()
+                C_p[s,:] = Rinv.left_multiply(A_p[s,:])
+    
+            return C_p
+        
+        return u_prodRinvA_pdaf
+            
+    def build_init_obsvar(self, das, model):
+        
+        def u_init_obsvar_pdaf(step, dim_obs_p, obs_p, meanvar):
+            """
+            The routine is called in the global filters during the analysis or by the routine that 
+            computes an adaptive forgetting factor (PDAF_set_forget). The routine has to initialize
+            the mean observation error variance. For the global filters this should be the global mean.
+            
+            Parameters
+            ----------
+            step : int 
+                Current time step. 
+            dim_obs_p : int 
+                Size observation vector on this process. 
+            obs_p : (dim_obs_p,) ndarray 
+                Observed values on this process. 
+            meanvar : float 
+                Mean observation error variance. 
+                
+            Returns
+            -------
+            meanvar : float 
+                Mean observation error variance. 
+        
+            """
+            n_var, var = 0, 0.0
+            for obs in das.observations:
+                n_var += obs.covariance.pe.sum(len(obs.covariance.variance))
+                var += obs.covariance.pe.sum(np.sum(obs.covariance.variance))
+            
+            return var/float(n_var)
+            
+        return u_init_obsvar_pdaf
+
